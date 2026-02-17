@@ -7,9 +7,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/memorypilot/memorypilot/internal/embedding"
+	"github.com/memorypilot/memorypilot/internal/extractor"
 	"github.com/memorypilot/memorypilot/internal/store"
 	"github.com/memorypilot/memorypilot/internal/watcher"
 	"github.com/memorypilot/memorypilot/pkg/models"
+	"github.com/oklog/ulid/v2"
 )
 
 // Config holds agent configuration
@@ -37,6 +40,8 @@ func DefaultConfig() *Config {
 type Agent struct {
 	config     *Config
 	store      *store.Store
+	extractor  extractor.Extractor
+	embedder   embedding.Embedder
 	eventQueue chan models.Event
 	watchers   []watcher.Watcher
 	ctx        context.Context
@@ -53,11 +58,19 @@ func New(cfg *Config) (*Agent, error) {
 		return nil, fmt.Errorf("failed to open store: %w", err)
 	}
 
+	// Initialize extractor (Ollama)
+	ext := extractor.NewOllamaExtractor("", cfg.ExtractionModel)
+
+	// Initialize embedder (Ollama)
+	emb := embedding.NewOllamaEmbedder("", "nomic-embed-text")
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	a := &Agent{
 		config:     cfg,
 		store:      s,
+		extractor:  ext,
+		embedder:   emb,
 		eventQueue: make(chan models.Event, 10000),
 		ctx:        ctx,
 		cancel:     cancel,
@@ -181,8 +194,61 @@ func (a *Agent) processEvents() {
 func (a *Agent) processBatch(events []models.Event) {
 	log.Printf("Processing batch of %d events...", len(events))
 
-	// TODO: Call LLM to extract memories from events
-	// For now, just mark events as processed
+	// Extract memories using LLM
+	extracted, err := a.extractor.Extract(events)
+	if err != nil {
+		log.Printf("Extraction failed: %v", err)
+		// Still mark events as processed to avoid reprocessing
+		for _, e := range events {
+			a.store.MarkEventProcessed(e.ID)
+		}
+		return
+	}
+
+	log.Printf("Extracted %d memories from batch", len(extracted))
+
+	// Create memories in store
+	for _, ext := range extracted {
+		now := time.Now()
+		memory := models.Memory{
+			ID:      ulid.Make().String(),
+			Type:    models.MemoryType(ext.Type),
+			Content: ext.Content,
+			Summary: ext.Summary,
+			Scope:   models.MemoryScopePersonal,
+			Source: models.Source{
+				Type:      models.SourceTypeGit, // Default, could be smarter
+				Reference: "batch",
+				Timestamp: now,
+			},
+			Confidence:     ext.Confidence,
+			Importance:     1.0,
+			Topics:         ext.Topics,
+			CreatedAt:      now,
+			LastAccessedAt: now,
+			AccessCount:    0,
+		}
+
+		// Save memory
+		if err := a.store.CreateMemory(&memory); err != nil {
+			log.Printf("Failed to save memory: %v", err)
+			continue
+		}
+
+		// Generate and store embedding
+		emb, err := a.embedder.Embed(memory.Content)
+		if err != nil {
+			log.Printf("Failed to generate embedding: %v", err)
+		} else if emb != nil {
+			if err := a.store.UpdateMemoryEmbedding(memory.ID, emb); err != nil {
+				log.Printf("Failed to store embedding: %v", err)
+			}
+		}
+
+		log.Printf("Created memory: [%s] %s", memory.Type, memory.Summary)
+	}
+
+	// Mark events as processed
 	for _, e := range events {
 		if err := a.store.MarkEventProcessed(e.ID); err != nil {
 			log.Printf("Failed to mark event processed: %v", err)

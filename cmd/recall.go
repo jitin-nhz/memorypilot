@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/memorypilot/memorypilot/internal/embedding"
 	"github.com/memorypilot/memorypilot/internal/store"
 	"github.com/memorypilot/memorypilot/pkg/models"
 	"github.com/spf13/cobra"
@@ -45,26 +46,47 @@ Examples:
 		limit, _ := cmd.Flags().GetInt("limit")
 		typeFilter, _ := cmd.Flags().GetString("type")
 		scopeFilter, _ := cmd.Flags().GetStringSlice("scope")
+		semantic, _ := cmd.Flags().GetBool("semantic")
 		
-		req := models.RecallRequest{
-			Query: query,
-			Limit: limit,
-		}
+		var memories []models.Memory
 		
-		if typeFilter != "" {
-			req.Types = []models.MemoryType{models.MemoryType(typeFilter)}
-		}
-		
-		if len(scopeFilter) > 0 {
-			for _, s := range scopeFilter {
-				req.Scope = append(req.Scope, models.MemoryScope(s))
+		if semantic {
+			// Try semantic search with embeddings
+			embedder := embedding.NewOllamaEmbedder("", "nomic-embed-text")
+			queryEmb, err := embedder.Embed(query)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Semantic search unavailable (%v), falling back to keyword search\n", err)
+				semantic = false
+			} else {
+				memories, err = s.HybridSearch(query, queryEmb, limit)
+				if err != nil {
+					return fmt.Errorf("hybrid search failed: %w", err)
+				}
 			}
 		}
 		
-		// Search
-		memories, err := s.Recall(req)
-		if err != nil {
-			return fmt.Errorf("recall failed: %w", err)
+		if !semantic {
+			// Keyword search
+			req := models.RecallRequest{
+				Query: query,
+				Limit: limit,
+			}
+			
+			if typeFilter != "" {
+				req.Types = []models.MemoryType{models.MemoryType(typeFilter)}
+			}
+			
+			if len(scopeFilter) > 0 {
+				for _, sc := range scopeFilter {
+					req.Scope = append(req.Scope, models.MemoryScope(sc))
+				}
+			}
+			
+			var err error
+			memories, err = s.Recall(req)
+			if err != nil {
+				return fmt.Errorf("recall failed: %w", err)
+			}
 		}
 		
 		// Check if JSON output requested
@@ -124,4 +146,5 @@ func init() {
 	recallCmd.Flags().StringP("type", "t", "", "Filter by memory type (decision|pattern|fact|preference|mistake|learning)")
 	recallCmd.Flags().StringSliceP("scope", "s", []string{}, "Filter by scope (personal|project|team)")
 	recallCmd.Flags().Bool("json", false, "Output as JSON")
+	recallCmd.Flags().BoolP("semantic", "S", true, "Use semantic search (requires Ollama)")
 }

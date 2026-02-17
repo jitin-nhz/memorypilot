@@ -2,8 +2,10 @@ package store
 
 import (
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -387,4 +389,183 @@ func (s *Store) MarkEventProcessed(eventID string) error {
 		UPDATE events SET processed_at = ? WHERE id = ?
 	`, time.Now(), eventID)
 	return err
+}
+
+// UpdateMemoryEmbedding stores the embedding for a memory
+func (s *Store) UpdateMemoryEmbedding(memoryID string, embedding []float32) error {
+	blob := encodeEmbedding(embedding)
+	_, err := s.db.Exec(`
+		UPDATE memories SET embedding = ? WHERE id = ?
+	`, blob, memoryID)
+	return err
+}
+
+// SemanticSearch searches memories using vector similarity
+func (s *Store) SemanticSearch(queryEmbedding []float32, limit int) ([]models.Memory, error) {
+	// Get all memories with embeddings
+	rows, err := s.db.Query(`
+		SELECT id, type, content, summary, scope, project_id, team_id,
+			   source_type, source_reference, source_timestamp,
+			   confidence, importance, topics, related_memories, embedding,
+			   created_at, last_accessed_at, access_count, expires_at
+		FROM memories
+		WHERE embedding IS NOT NULL
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type scoredMemory struct {
+		memory models.Memory
+		score  float32
+	}
+
+	var scored []scoredMemory
+	for rows.Next() {
+		var m models.Memory
+		var topicsJSON, relatedJSON sql.NullString
+		var projectID, teamID sql.NullString
+		var expiresAt sql.NullTime
+		var embeddingBlob []byte
+
+		err := rows.Scan(
+			&m.ID, &m.Type, &m.Content, &m.Summary, &m.Scope, &projectID, &teamID,
+			&m.Source.Type, &m.Source.Reference, &m.Source.Timestamp,
+			&m.Confidence, &m.Importance, &topicsJSON, &relatedJSON, &embeddingBlob,
+			&m.CreatedAt, &m.LastAccessedAt, &m.AccessCount, &expiresAt,
+		)
+		if err != nil {
+			continue
+		}
+
+		if len(embeddingBlob) == 0 {
+			continue
+		}
+
+		embedding := decodeEmbedding(embeddingBlob)
+		similarity := cosineSimilarity(queryEmbedding, embedding)
+
+		if projectID.Valid {
+			m.ProjectID = &projectID.String
+		}
+		if teamID.Valid {
+			m.TeamID = &teamID.String
+		}
+		if expiresAt.Valid {
+			m.ExpiresAt = &expiresAt.Time
+		}
+		if topicsJSON.Valid {
+			json.Unmarshal([]byte(topicsJSON.String), &m.Topics)
+		}
+		if relatedJSON.Valid {
+			json.Unmarshal([]byte(relatedJSON.String), &m.RelatedMemories)
+		}
+
+		// Combine similarity with importance
+		score := similarity*0.7 + float32(m.Importance)*0.3
+		scored = append(scored, scoredMemory{memory: m, score: score})
+	}
+
+	// Sort by score (simple bubble sort for now, can optimize later)
+	for i := 0; i < len(scored); i++ {
+		for j := i + 1; j < len(scored); j++ {
+			if scored[j].score > scored[i].score {
+				scored[i], scored[j] = scored[j], scored[i]
+			}
+		}
+	}
+
+	// Take top N
+	var results []models.Memory
+	for i := 0; i < len(scored) && i < limit; i++ {
+		results = append(results, scored[i].memory)
+		s.recordAccess(scored[i].memory.ID)
+	}
+
+	return results, nil
+}
+
+// HybridSearch combines semantic and keyword search
+func (s *Store) HybridSearch(query string, queryEmbedding []float32, limit int) ([]models.Memory, error) {
+	// Get semantic results
+	var semanticResults []models.Memory
+	if queryEmbedding != nil && len(queryEmbedding) > 0 {
+		var err error
+		semanticResults, err = s.SemanticSearch(queryEmbedding, limit*2)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Get keyword results
+	keywordResults, err := s.Recall(models.RecallRequest{
+		Query: query,
+		Limit: limit * 2,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Merge results (semantic results first, then keyword results not in semantic)
+	seen := make(map[string]bool)
+	var merged []models.Memory
+
+	for _, m := range semanticResults {
+		if !seen[m.ID] {
+			seen[m.ID] = true
+			merged = append(merged, m)
+		}
+	}
+
+	for _, m := range keywordResults {
+		if !seen[m.ID] {
+			seen[m.ID] = true
+			merged = append(merged, m)
+		}
+	}
+
+	// Limit results
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+
+	return merged, nil
+}
+
+// Helper functions for embedding storage
+
+func encodeEmbedding(embedding []float32) []byte {
+	buf := make([]byte, len(embedding)*4)
+	for i, v := range embedding {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(v))
+	}
+	return buf
+}
+
+func decodeEmbedding(data []byte) []float32 {
+	embedding := make([]float32, len(data)/4)
+	for i := range embedding {
+		embedding[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[i*4:]))
+	}
+	return embedding
+}
+
+func cosineSimilarity(a, b []float32) float32 {
+	if len(a) != len(b) || len(a) == 0 {
+		return 0
+	}
+
+	var dot, normA, normB float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		normA += float64(a[i]) * float64(a[i])
+		normB += float64(b[i]) * float64(b[i])
+	}
+
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+
+	return float32(dot / (math.Sqrt(normA) * math.Sqrt(normB)))
 }
